@@ -58,13 +58,40 @@ URL_PATTERN = re.compile(
 )
 
 def filter_links(text: str) -> str:
-    """Keep only URLs that contain 'tera', remove everything else."""
+    """
+    - Find the LAST 'tera' link in the text.
+    - Keep everything above it unchanged (including non-tera links).
+    - Keep the last tera link itself.
+    - Remove everything after the last tera link.
+    - Non-tera links that appear BEFORE the last tera link are also removed.
+    """
     if not text:
         return text or ""
-    def keep_or_remove(m):
-        url = m.group(0)
-        return url if "tera" in url.lower() else ""
-    result = URL_PATTERN.sub(keep_or_remove, text)
+
+    # Find all URL matches with their positions
+    matches = list(URL_PATTERN.finditer(text))
+
+    # Find the last match whose URL contains 'tera'
+    last_tera = None
+    for m in matches:
+        if "tera" in m.group(0).lower():
+            last_tera = m
+
+    # No tera link found — remove all links, return cleaned text
+    if last_tera is None:
+        result = URL_PATTERN.sub("", text)
+        result = re.sub(r'  +', ' ', result).strip()
+        return result
+
+    # Split text at the end of the last tera link
+    before_and_link = text[:last_tera.end()]  # everything up to & including last tera link
+    # everything after last tera link is discarded
+
+    # In the "before_and_link" portion, remove all non-tera links
+    def keep_tera_only(m):
+        return m.group(0) if "tera" in m.group(0).lower() else ""
+
+    result = URL_PATTERN.sub(keep_tera_only, before_and_link)
     result = re.sub(r'  +', ' ', result).strip()
     return result
 
