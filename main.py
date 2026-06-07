@@ -19,13 +19,17 @@ logger = logging.getLogger(__name__)
 
 # ── ENV ──────────────────────────────────────────────────────────────
 BOT_TOKEN    = os.environ["BOT_TOKEN"]
-ADMIN_ID     = int(os.environ["ADMIN_ID"])
 DATABASE_URL = os.environ["DATABASE_URL"]
 CHANNEL_IDS  = [int(x.strip()) for x in os.environ["CHANNEL_IDS"].split(",")]
 
+# ADMIN_IDS: comma-separated; first ID is the owner
+_env_admin_ids = [int(x.strip()) for x in os.environ["ADMIN_IDS"].split(",")]
+OWNER_ID       = _env_admin_ids[0]
+
 # ── DB POOL + IN-MEMORY CACHE ─────────────────────────────────────────
 _pool: asyncpg.Pool = None
-_footer_cache: str = None   # in-memory footer cache
+_footer_cache: str  = None
+_admin_cache: set   = None
 
 async def get_pool() -> asyncpg.Pool:
     global _pool
@@ -48,8 +52,57 @@ async def init_db():
                 file_id  TEXT,
                 raw_text TEXT
             );
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id BIGINT PRIMARY KEY
+            );
         """)
+        # Seed env-defined admins into DB (idempotent)
+        for aid in _env_admin_ids:
+            await conn.execute(
+                "INSERT INTO admins (user_id) VALUES ($1) ON CONFLICT DO NOTHING",
+                aid
+            )
     logger.info("DB initialized.")
+
+# ── ADMIN HELPERS ─────────────────────────────────────────────────────
+async def load_admins() -> set:
+    global _admin_cache
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM admins")
+    _admin_cache = {r["user_id"] for r in rows}
+    return _admin_cache
+
+async def get_admins() -> set:
+    global _admin_cache
+    if _admin_cache is not None:
+        return _admin_cache
+    return await load_admins()
+
+def is_admin_id(user_id: int, admins: set) -> bool:
+    return user_id in admins
+
+def is_owner_id(user_id: int) -> bool:
+    return user_id == OWNER_ID
+
+async def add_admin_db(user_id: int):
+    global _admin_cache
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO admins (user_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            user_id
+        )
+    if _admin_cache is not None:
+        _admin_cache.add(user_id)
+
+async def remove_admin_db(user_id: int):
+    global _admin_cache
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM admins WHERE user_id = $1", user_id)
+    if _admin_cache is not None:
+        _admin_cache.discard(user_id)
 
 # ── HELPERS ───────────────────────────────────────────────────────────
 URL_PATTERN = re.compile(
@@ -60,34 +113,27 @@ URL_PATTERN = re.compile(
 def filter_links(text: str) -> str:
     """
     - Find the LAST 'tera' link in the text.
-    - Keep everything above it unchanged (including non-tera links).
+    - Keep everything above it unchanged (non-tera links removed).
     - Keep the last tera link itself.
     - Remove everything after the last tera link.
-    - Non-tera links that appear BEFORE the last tera link are also removed.
     """
     if not text:
         return text or ""
 
-    # Find all URL matches with their positions
     matches = list(URL_PATTERN.finditer(text))
 
-    # Find the last match whose URL contains 'tera'
     last_tera = None
     for m in matches:
         if "tera" in m.group(0).lower():
             last_tera = m
 
-    # No tera link found — remove all links, return cleaned text
     if last_tera is None:
         result = URL_PATTERN.sub("", text)
         result = re.sub(r'  +', ' ', result).strip()
         return result
 
-    # Split text at the end of the last tera link
-    before_and_link = text[:last_tera.end()]  # everything up to & including last tera link
-    # everything after last tera link is discarded
+    before_and_link = text[:last_tera.end()]
 
-    # In the "before_and_link" portion, remove all non-tera links
     def keep_tera_only(m):
         return m.group(0) if "tera" in m.group(0).lower() else ""
 
@@ -123,9 +169,6 @@ async def add_pending(msg_type, caption=None, file_id=None, raw_text=None):
             msg_type, caption, file_id, raw_text
         )
 
-def is_admin(update: Update) -> bool:
-    return update.effective_user.id == ADMIN_ID
-
 def build_preview(text: str, footer: str) -> str:
     if footer:
         return f"{text}\n\n{footer}".strip()
@@ -133,14 +176,17 @@ def build_preview(text: str, footer: str) -> str:
 
 # ── COMMANDS ──────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+    admins = await get_admins()
+    if not is_admin_id(update.effective_user.id, admins):
         return
     pending = await get_pending()
     footer  = await get_footer()
+    is_owner = is_owner_id(update.effective_user.id)
     await update.message.reply_text(
         f"👋 *Link Filter Bot Active*\n\n"
         f"📦 Pending posts: `{len(pending)}`\n"
-        f"📝 Footer: `{'Set ✅' if footer else 'Not set ❌'}`\n\n"
+        f"📝 Footer: `{'Set ✅' if footer else 'Not set ❌'}`\n"
+        f"👤 Role: `{'Owner 👑' if is_owner else 'Admin'}`\n\n"
         f"*How to use:*\n"
         f"1. Posts bhejo (text/photo/video/doc)\n"
         f"2. Preview turant milega\n"
@@ -150,13 +196,12 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_footer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+    admins = await get_admins()
+    if not is_admin_id(update.effective_user.id, admins):
         return
 
     msg = update.message
-    # Full text after /footer command (preserves newlines)
     full_text = msg.text or ""
-    # Strip the /footer command prefix
     if full_text.lower().startswith("/footer"):
         content = full_text[len("/footer"):].strip()
     else:
@@ -178,14 +223,15 @@ async def cmd_footer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM footer")
         await conn.execute("INSERT INTO footer (content) VALUES ($1)", content)
-    _footer_cache = content  # update cache immediately
+    _footer_cache = content
     await msg.reply_text(
         f"✅ <b>Footer saved!</b>\n\n{content}",
         parse_mode="HTML"
     )
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+    admins = await get_admins()
+    if not is_admin_id(update.effective_user.id, admins):
         return
     count = len(await get_pending())
     await clear_pending()
@@ -193,6 +239,60 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🗑️ *Batch cancelled.*\n`{count}` posts clear ho gaye.\n\nNaye posts bhejo naya batch shuru karne ke liye.",
         parse_mode="Markdown"
+    )
+
+async def cmd_admins(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: list all current admins."""
+    if not is_owner_id(update.effective_user.id):
+        await update.message.reply_text("⛔ Sirf owner ye command use kar sakta hai.")
+        return
+    admins = await get_admins()
+    lines = []
+    for uid in sorted(admins):
+        tag = " 👑 (owner)" if uid == OWNER_ID else ""
+        lines.append(f"• <code>{uid}</code>{tag}")
+    text = "<b>👥 Current Admins:</b>\n" + "\n".join(lines)
+    await update.message.reply_text(text, parse_mode="HTML")
+
+async def cmd_addadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: /addadmin <user_id>"""
+    if not is_owner_id(update.effective_user.id):
+        await update.message.reply_text("⛔ Sirf owner admins add kar sakta hai.")
+        return
+    args = ctx.args
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Usage: <code>/addadmin &lt;user_id&gt;</code>", parse_mode="HTML")
+        return
+    new_id = int(args[0])
+    admins = await get_admins()
+    if new_id in admins:
+        await update.message.reply_text(f"ℹ️ <code>{new_id}</code> pehle se admin hai.", parse_mode="HTML")
+        return
+    await add_admin_db(new_id)
+    await update.message.reply_text(
+        f"✅ <code>{new_id}</code> ko admin bana diya gaya.", parse_mode="HTML"
+    )
+
+async def cmd_removeadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: /removeadmin <user_id>"""
+    if not is_owner_id(update.effective_user.id):
+        await update.message.reply_text("⛔ Sirf owner admins remove kar sakta hai.")
+        return
+    args = ctx.args
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Usage: <code>/removeadmin &lt;user_id&gt;</code>", parse_mode="HTML")
+        return
+    target_id = int(args[0])
+    if target_id == OWNER_ID:
+        await update.message.reply_text("⛔ Owner ko remove nahi kar sakte.")
+        return
+    admins = await get_admins()
+    if target_id not in admins:
+        await update.message.reply_text(f"ℹ️ <code>{target_id}</code> admin nahi hai.", parse_mode="HTML")
+        return
+    await remove_admin_db(target_id)
+    await update.message.reply_text(
+        f"✅ <code>{target_id}</code> ko admin se remove kar diya gaya.", parse_mode="HTML"
     )
 
 async def send_one(bot, post, channel_id, footer, retries=3):
@@ -220,7 +320,6 @@ async def send_one(bot, post, channel_id, footer, retries=3):
 
         except Exception as e:
             err_str = str(e)
-            # FloodWait — wait and retry
             if "flood" in err_str.lower() or "retry" in err_str.lower():
                 import re as _re
                 wait = 30
@@ -230,7 +329,6 @@ async def send_one(bot, post, channel_id, footer, retries=3):
                 logger.warning(f"FloodWait {wait}s for channel {channel_id}, attempt {attempt+1}")
                 await asyncio.sleep(wait)
                 continue
-            # Other error — log and return
             logger.error(f"Post {post['id']} → {channel_id} FAILED: {err_str}")
             return False, err_str
 
@@ -238,7 +336,8 @@ async def send_one(bot, post, channel_id, footer, retries=3):
 
 
 async def cmd_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+    admins = await get_admins()
+    if not is_admin_id(update.effective_user.id, admins):
         return
     posts = await get_pending()
     if not posts:
@@ -261,7 +360,7 @@ async def cmd_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             sent += 1
         else:
             failed_logs.append(f"Post #{i+1} → {channel_id}: {err}")
-        await asyncio.sleep(0.8)  # safe gap between sends
+        await asyncio.sleep(0.8)
 
     await clear_pending()
     ctx.user_data["collecting"] = False
@@ -271,28 +370,26 @@ async def cmd_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         errors = total - sent
         summary = f"⚠️ <b>{sent}/{total} sent.</b> {errors} failed.\n\n"
-        summary += "\n".join(failed_logs[:10])  # show first 10 errors
+        summary += "\n".join(failed_logs[:10])
 
     await status_msg.edit_text(summary, parse_mode="HTML")
 
 # ── MESSAGE HANDLER ───────────────────────────────────────────────────
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+    admins = await get_admins()
+    if not is_admin_id(update.effective_user.id, admins):
         return
     msg = update.message
     if not msg:
         return
 
-    # First post of new batch → clear old data
     if not ctx.user_data.get("collecting"):
         await clear_pending()
         ctx.user_data["collecting"] = True
         ctx.user_data["batch_count"] = 0
 
-    # footer from cache — instant, no DB call
     footer = await get_footer()
 
-    # ── TEXT ──
     if msg.text and not msg.text.startswith("/"):
         filtered = filter_links(msg.text)
         await add_pending("text", raw_text=filtered)
@@ -302,7 +399,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-    # ── PHOTO ──
     elif msg.photo:
         file_id = msg.photo[-1].file_id
         caption = filter_links(msg.caption or "")
@@ -313,7 +409,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             caption=f"📋 Preview:\n\n{preview_caption}"
         )
 
-    # ── VIDEO ──
     elif msg.video:
         file_id = msg.video.file_id
         caption = filter_links(msg.caption or "")
@@ -324,7 +419,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             caption=f"📋 Preview:\n\n{preview_caption}"
         )
 
-    # ── DOCUMENT ──
     elif msg.document:
         file_id = msg.document.file_id
         caption = filter_links(msg.caption or "")
@@ -335,7 +429,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             caption=f"📋 Preview:\n\n{preview_caption}"
         )
 
-    # ── AUDIO ──
     elif msg.audio:
         file_id = msg.audio.file_id
         caption = filter_links(msg.caption or "")
@@ -355,11 +448,15 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── SETUP & MAIN ──────────────────────────────────────────────────────
 async def post_init(app: Application):
     await init_db()
+    await load_admins()   # warm the cache
     await app.bot.set_my_commands([
-        BotCommand("start",  "Bot status dekhein"),
-        BotCommand("footer", "Footer set ya dekhein"),
-        BotCommand("send",   "Saare posts channels mein bhejein"),
-        BotCommand("cancel", "Current batch cancel karein"),
+        BotCommand("start",       "Bot status dekhein"),
+        BotCommand("footer",      "Footer set ya dekhein"),
+        BotCommand("send",        "Saare posts channels mein bhejein"),
+        BotCommand("cancel",      "Current batch cancel karein"),
+        BotCommand("admins",      "Admins list dekhein (owner only)"),
+        BotCommand("addadmin",    "Admin add karein (owner only)"),
+        BotCommand("removeadmin", "Admin remove karein (owner only)"),
     ])
     logger.info("Commands registered.")
 
@@ -371,10 +468,13 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("footer", cmd_footer))
-    app.add_handler(CommandHandler("send",   cmd_send))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("start",       cmd_start))
+    app.add_handler(CommandHandler("footer",      cmd_footer))
+    app.add_handler(CommandHandler("send",        cmd_send))
+    app.add_handler(CommandHandler("cancel",      cmd_cancel))
+    app.add_handler(CommandHandler("admins",      cmd_admins))
+    app.add_handler(CommandHandler("addadmin",    cmd_addadmin))
+    app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
     app.add_handler(MessageHandler(
         filters.ALL & ~filters.COMMAND & filters.ChatType.PRIVATE,
         handle_message
