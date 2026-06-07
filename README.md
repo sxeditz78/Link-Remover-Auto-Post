@@ -1,71 +1,193 @@
-# 📦 Link Filter Telegram Bot
+# 🤖 Link Filter Bot — Tera Edition
 
-## Files
-- `main.py` — Bot source code
-- `requirements.txt` — Python dependencies
-- `Procfile` — Railway deployment config
+A Telegram bot for admins to **filter, preview, and batch-send posts** to multiple channels — keeping only `tera` links (e.g. Terabox) and removing all other URLs automatically.
 
 ---
 
-## 🚀 Railway Deployment
+## ✨ Features
 
-### Step 1 — GitHub par push karo
-```bash
-git init
-git add .
-git commit -m "init bot"
-git remote add origin https://github.com/YOUR/REPO.git
-git push -u origin main
+- 🔗 **Auto Link Filter** — keeps only URLs containing `tera`, removes everything else
+- 📋 **Instant Preview** — shows filtered preview before sending
+- 📦 **Batch Posting** — collect multiple posts then send all at once
+- 📺 **Multi-Channel Support** — distributes posts across multiple channels (round-robin)
+- 📝 **Custom Footer** — set a persistent footer appended to every post
+- 🔁 **FloodWait Retry** — auto-retries on Telegram rate limits
+- 👥 **Multi-Admin Support** — multiple admins, one owner with full control
+
+---
+
+## 🗂️ Project Structure
+
+```
+.
+├── main.py          # Bot source code
+├── requirements.txt # Python dependencies
+├── Procfile         # For deployment (Railway/Render)
+└── .env             # Environment variables (not committed)
 ```
 
-### Step 2 — Railway mein import karo
-1. railway.app → New Project → Deploy from GitHub repo
-2. Repo select karo
+---
 
-### Step 3 — Environment Variables set karo
-Railway dashboard → Variables tab mein yeh add karo:
+## ⚙️ Environment Variables
 
-| Variable       | Example Value                                          |
-|----------------|--------------------------------------------------------|
-| `BOT_TOKEN`    | `123456789:ABCdef...`                                  |
-| `ADMIN_ID`     | `987654321`                                            |
-| `DATABASE_URL` | `postgresql://user:pass@ep-xxx.neon.tech/neondb?sslmode=require` |
-| `CHANNEL_IDS`  | `-100123456789,-100987654321`                          |
+| Variable       | Description                                                      | Example                                        |
+|----------------|------------------------------------------------------------------|------------------------------------------------|
+| `BOT_TOKEN`    | Your bot token from [@BotFather](https://t.me/BotFather)        | `123456:ABC-DEF...`                            |
+| `ADMIN_IDS`    | Comma-separated admin user IDs — **first ID is the owner**       | `987654321,111222333,444555666`                 |
+| `DATABASE_URL` | PostgreSQL connection string                                     | `postgresql://user:pass@host/db?sslmode=require` |
+| `CHANNEL_IDS`  | Comma-separated target channel IDs                               | `-1001234567890,-1009876543210`                 |
 
-> **Note:** `CHANNEL_IDS` = comma-separated channel IDs (bot must be admin in each channel)
-
-### Step 4 — Deploy
-Railway auto-deploy ho jaata hai push par. Worker service start hogi.
+> **Note:** The first ID in `ADMIN_IDS` becomes the **owner** — only the owner can add/remove other admins.
 
 ---
 
-## 🗃️ Neon DB Setup
-1. console.neon.tech → New Project
-2. Connection string copy karo (`postgresql://...`)
-3. `DATABASE_URL` mein paste karo
-4. Tables automatically create hongi first run par
+## 🚀 Setup & Deployment
+
+### Local / VPS
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/YOUR/REPO.git
+cd REPO
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Create env file
+nano .bot.env   # fill in all variables
+
+# 4. Run
+python main.py
+```
+
+### Systemd Service (Google Cloud / Linux VPS)
+
+```ini
+# /etc/systemd/system/telegrambot.service
+[Unit]
+Description=Telegram Link Filter Bot (Tera)
+After=network.target
+
+[Service]
+User=your_user
+WorkingDirectory=/home/your_user/REPO
+EnvironmentFile=/home/your_user/REPO/.bot.env
+ExecStart=/usr/bin/python3 main.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable telegrambot
+sudo systemctl start telegrambot
+```
+
+### Railway Deployment
+
+1. Push code to GitHub
+2. railway.app → New Project → Deploy from GitHub repo
+3. Add environment variables in the Variables tab
+4. Railway auto-deploys on every push
 
 ---
 
-## 📖 Bot Usage
+## 📖 Commands
 
-| Action | Description |
-|--------|-------------|
-| Post bhejo | Text/Photo/Video/Doc bot ko bhejo — preview milega |
-| `/send` | Saare pending posts channels mein distribute |
-| `/cancel` | Current batch clear karo |
-| `/footer Join @ch` | Footer set karo |
-| `/footer` | Current footer dekhein |
-| `/start` | Bot status |
+### All Admins
 
-### Link Filter Logic
-- `https://terabox.com/xyz` → **RAKHEGA** (tera word hai)
-- `https://drive.google.com/xyz` → **HATAYEGA**
-- `https://t.me/someChannel` → **HATAYEGA**
-- `https://myteralink.com` → **RAKHEGA** (tera word hai)
+| Command   | Description                                  |
+|-----------|----------------------------------------------|
+| `/start`  | Show bot status, pending count, footer, role |
+| `/footer` | View or set footer text (HTML supported)     |
+| `/send`   | Send all pending posts to channels           |
+| `/cancel` | Clear current batch without sending          |
 
-### Split Distribution
-Posts round-robin style distribute hote hain channels mein:
-- Post 1 → Channel 1
-- Post 2 → Channel 2
-- Post 3 → Channel 1 (agar 2 channels hain)
+### Owner Only
+
+| Command                  | Description                     |
+|--------------------------|---------------------------------|
+| `/admins`                | List all current admins         |
+| `/addadmin <user_id>`    | Add a new admin                 |
+| `/removeadmin <user_id>` | Remove an existing admin        |
+
+---
+
+## 📤 How to Use
+
+1. **Send posts** to the bot (text, photo, video, document, audio)
+2. Bot filters all non-`tera` links and shows a **preview**
+3. Send more posts to build a batch
+4. Run `/send` — bot distributes posts across all configured channels
+5. Use `/cancel` to discard the batch and start fresh
+
+---
+
+## 🔗 Link Filtering Logic
+
+```
+Input:  "Check this out https://drive.google.com/xyz and https://terabox.com/abc"
+Output: "Check this out https://terabox.com/abc"
+```
+
+- Last `tera` URL is kept; everything after it is removed
+- All non-`tera` URLs before it are also removed
+- If no `tera` URL found → all links are removed
+
+### Examples
+
+| URL | Result |
+|-----|--------|
+| `https://terabox.com/xyz` | ✅ Kept |
+| `https://myteralink.com/abc` | ✅ Kept |
+| `https://drive.google.com/xyz` | ❌ Removed |
+| `https://t.me/someChannel` | ❌ Removed |
+
+---
+
+## 👥 Admin System
+
+- **Owner** = first ID in `ADMIN_IDS` env var (permanent, cannot be removed)
+- **Admins** = stored in DB, persist across restarts
+- All env-defined IDs are auto-seeded into DB on startup
+- Owner manages admins at runtime via `/addadmin` and `/removeadmin`
+
+---
+
+## 🗄️ Database Schema
+
+```sql
+CREATE TABLE footer (
+    id      SERIAL PRIMARY KEY,
+    content TEXT NOT NULL
+);
+
+CREATE TABLE pending_posts (
+    id       SERIAL PRIMARY KEY,
+    msg_type TEXT NOT NULL,   -- text | photo | video | document | audio
+    caption  TEXT,
+    file_id  TEXT,
+    raw_text TEXT
+);
+
+CREATE TABLE admins (
+    user_id BIGINT PRIMARY KEY
+);
+```
+
+---
+
+## 📦 Dependencies
+
+| Package               | Version | Purpose                  |
+|-----------------------|---------|--------------------------|
+| `python-telegram-bot` | 21.10   | Telegram Bot API wrapper |
+| `asyncpg`             | 0.30.0  | Async PostgreSQL client  |
+
+---
+
+## 📄 License
+
+MIT — free to use and modify.
